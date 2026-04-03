@@ -18,12 +18,19 @@ USE_PCT = 0.99
 
 ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 env = dotenv_values(ENV_PATH)
+ENV_MAP = {}
+for k, v in (env or {}).items():
+    ks = str(k).strip() if k is not None else ""
+    if not ks:
+        continue
+    vs = str(v).strip() if v is not None else ""
+    ENV_MAP[ks] = vs
 
 # Railway/production thường truyền secrets qua environment variables thay vì file .env
 def _cfg(name, default=""):
     v = os.getenv(name)
     if v is None or str(v).strip() == "":
-        v = env.get(name, default)
+        v = ENV_MAP.get(name, default)
     return str(v).strip() if v is not None else default
 
 
@@ -58,7 +65,7 @@ COOLDOWN = 0.3
 
 SPREAD_MAP = {}
 FEE_MAP = {}
-for key, val in env.items():
+for key, val in ENV_MAP.items():
     if key.startswith("SPREAD_"):
         try: SPREAD_MAP[key[7:].upper()] = float(val)
         except ValueError: pass
@@ -517,14 +524,17 @@ def main():
         print(f"  {D}99% bal: ~{fmt(q * USE_PCT)} {QUOTE} ≈ {est} {BASE}{X}")
     print(f"  {D}Min amount: {min_amt or '?'}  |  Min notional: {min_cost or '?'} {QUOTE}{X}")
 
-    if not IS_TESTNET:
-        c = input(f"\n  {B}▶ Xác nhận chạy {PAIR} trên MAINNET? (yes/no): {X}").strip().lower()
-        if c != "yes":
-            print(f"  {D}Đã hủy.{X}"); return
+    if DEFAULT_PAIR:
+        print(f"  {D}Auto-run vì đã có DEFAULT_PAIR={DEFAULT_PAIR}{X}")
     else:
-        c = input(f"\n  {B}▶ Chạy {PAIR}? (y/n) [{C}y{X}{B}]: {X}").strip().lower()
-        if c not in ("", "y", "yes"):
-            print(f"  {D}Đã hủy.{X}"); return
+        if not IS_TESTNET:
+            c = input(f"\n  {B}▶ Xác nhận chạy {PAIR} trên MAINNET? (yes/no): {X}").strip().lower()
+            if c != "yes":
+                print(f"  {D}Đã hủy.{X}"); return
+        else:
+            c = input(f"\n  {B}▶ Chạy {PAIR}? (y/n) [{C}y{X}{B}]: {X}").strip().lower()
+            if c not in ("", "y", "yes"):
+                print(f"  {D}Đã hủy.{X}"); return
 
     tlog = TLog(PAIR)
     summary = {"total": 0, "wins": 0, "losses": 0, "retries": 0,
