@@ -19,15 +19,40 @@ USE_PCT = 0.99
 ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 env = dotenv_values(ENV_PATH)
 
-API_KEY = env.get("API_KEY", "")
-SECRET_KEY = env.get("SECRET_KEY", "")
-IS_TESTNET = env.get("TESTNET", "true").strip().lower() in ("true", "1", "yes")
+# Railway/production thường truyền secrets qua environment variables thay vì file .env
+def _cfg(name, default=""):
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        v = env.get(name, default)
+    return str(v).strip() if v is not None else default
 
-if not API_KEY or not SECRET_KEY:
-    print("\033[91m  ✗ Thiếu API_KEY hoặc SECRET_KEY trong .env\033[0m")
+
+API_KEY = _cfg("API_KEY", "")
+SECRET_KEY = _cfg("SECRET_KEY", "")
+MEXC_API_KEY = _cfg("MEXC_API_KEY", "")
+MEXC_SECRET_KEY = _cfg("MEXC_SECRET_KEY", "")
+IS_TESTNET = _cfg("TESTNET", "true").lower() in ("true", "1", "yes")
+DEFAULT_PAIR = _cfg("DEFAULT_PAIR", "")
+
+EXCHANGE_ID = _cfg("EXCHANGE", "binance").lower() or "binance"
+if EXCHANGE_ID not in ("binance", "mexc"):
+    print(f"\033[91m  ✗ EXCHANGE trong .env phải là 'binance' hoặc 'mexc' (hiện: {EXCHANGE_ID})\033[0m")
     sys.exit(1)
 
-BUY_TIMEOUT = float(env.get("BUY_RETRY_TIMEOUT", "5"))
+# Kiểm tra API keys theo sàn được chọn
+if EXCHANGE_ID == "binance":
+    if not API_KEY or not SECRET_KEY:
+        print("\033[91m  ✗ Thiếu API_KEY hoặc SECRET_KEY trong .env cho Binance\033[0m")
+        sys.exit(1)
+else:
+    # Cho phép fallback: nếu bạn chưa set MEXC_API_KEY/MEXC_SECRET_KEY thì dùng API_KEY/SECRET_KEY
+    if (not MEXC_API_KEY or not MEXC_SECRET_KEY) and (not API_KEY or not SECRET_KEY):
+        print("\033[91m  ✗ Thiếu MEXC_API_KEY/MEXC_SECRET_KEY (hoặc API_KEY/SECRET_KEY) trong .env cho MEXC\033[0m")
+        sys.exit(1)
+
+BUY_TIMEOUT = float(_cfg("BUY_RETRY_TIMEOUT", "5"))
+# Nghỉ sau khi một vòng BUY->SELL đã chốt xong
+POST_TRADE_PAUSE = float(_cfg("POST_TRADE_PAUSE", "30"))
 POLL_INTERVAL = 0.5
 COOLDOWN = 0.3
 
@@ -40,7 +65,7 @@ for key, val in env.items():
     if key.startswith("FEE_") and key != "FEE_DEFAULT":
         try: FEE_MAP[key[4:].upper()] = float(val)
         except ValueError: pass
-FEE_DEFAULT = float(env.get("FEE_DEFAULT", "0.1"))
+FEE_DEFAULT = float(_cfg("FEE_DEFAULT", "0.1"))
 
 SYMBOL = ""
 PAIR = ""
@@ -72,13 +97,34 @@ RATE_MAX = 1200
 # ═══════════════════════════════════════════════════════════════
 
 def create_exchange():
-    ex = ccxt.binance({
-        "apiKey": API_KEY, "secret": SECRET_KEY,
+    if EXCHANGE_ID == "binance":
+        ex = ccxt.binance({
+            "apiKey": API_KEY,
+            "secret": SECRET_KEY,
+            "enableRateLimit": True,
+            "timeout": 20000,
+            "options": {"defaultType": "spot"},
+        })
+        if IS_TESTNET:
+            ex.set_sandbox_mode(True)
+        return ex
+
+    # MEXC
+    mexc_key = MEXC_API_KEY or API_KEY
+    mexc_secret = MEXC_SECRET_KEY or SECRET_KEY
+    ex = ccxt.mexc({
+        "apiKey": mexc_key,
+        "secret": mexc_secret,
         "enableRateLimit": True,
+        "timeout": 20000,
         "options": {"defaultType": "spot"},
     })
-    if IS_TESTNET:
-        ex.set_sandbox_mode(True)
+    # MEXC testnet/sandbox có thể không tồn tại tùy ccxt; chỉ bật nếu có method
+    if IS_TESTNET and hasattr(ex, "set_sandbox_mode"):
+        try:
+            ex.set_sandbox_mode(True)
+        except Exception:
+            pass
     return ex
 
 
@@ -87,10 +133,21 @@ def create_exchange():
 # ═══════════════════════════════════════════════════════════════
 
 def fetch_ba(ex):
-    ob = ex.fetch_order_book(SYMBOL, limit=5)
-    if not ob["bids"] or not ob["asks"]:
-        raise ValueError("Order book trống")
-    return ob["bids"][0][0], ob["asks"][0][0]
+    # MEXC đôi lúc timeout khi gọi depth. Thêm retry/backoff để bot không crash.
+    last_err = None
+    for i in range(3):
+        try:
+            ob = ex.fetch_order_book(SYMBOL, limit=5)
+            if not ob.get("bids") or not ob.get("asks"):
+                raise ValueError("Order book trống")
+            return ob["bids"][0][0], ob["asks"][0][0]
+        except (ccxt.RequestTimeout, ccxt.NetworkError) as e:
+            last_err = e
+            time.sleep(0.8 + i * 0.6)
+        except Exception as e:
+            last_err = e
+            time.sleep(0.3 + i * 0.2)
+    raise last_err if last_err else Exception("fetch_ba failed")
 
 
 def fmt(v):
@@ -124,7 +181,12 @@ def inv_bal():
 
 def rate_used(ex):
     h = getattr(ex, "last_response_headers", None) or {}
-    u = h.get("x-mbx-used-weight-1m") or h.get("X-MBX-USED-WEIGHT-1M")
+    u = (
+        h.get("x-mbx-used-weight-1m")
+        or h.get("X-MBX-USED-WEIGHT-1M")
+        or h.get("x-mexc-used-weight-1m")
+        or h.get("X-MEXC-USED-WEIGHT-1M")
+    )
     return int(u) if u else None
 
 
@@ -148,6 +210,12 @@ def cancel_safe(ex, oid):
 def log(msg, color=""):
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     print(f"  {D}{ts}{X}  {color}{msg}{X}")
+
+
+def pause_after_trade():
+    if POST_TRADE_PAUSE > 0:
+        log(f"Nghỉ {POST_TRADE_PAUSE:.0f}s sau chu kỳ vừa chốt...", Y)
+        time.sleep(POST_TRADE_PAUSE)
 
 
 def net_pnl(sell_cost, buy_cost):
@@ -236,16 +304,12 @@ def wait_sell(ex, oid, cb=None):
 
 class TLog:
     def __init__(self, pair_tag):
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.fn = f"trades_{pair_tag}_{ts}.csv"
+        # Theo yêu cầu: không xuất CSV.
+        self.fn = "(disabled)"
         self.n = 0
-        with open(self.fn, "w", newline="", encoding="utf-8") as f:
-            csv.DictWriter(f, fieldnames=CSV_COLS).writeheader()
 
     def write(self, row):
-        with open(self.fn, "a", newline="", encoding="utf-8") as f:
-            csv.DictWriter(f, fieldnames=CSV_COLS).writerow(row)
-        self.n += 1
+        return
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -393,38 +457,54 @@ def main():
             fee = FEE_MAP.get(pair, FEE_DEFAULT)
             print(f"    {C}{pair}{X}: spread {pct}%  |  fee {fee}%/side")
 
-    print(f"\n  {D}Kết nối Binance {'Testnet' if IS_TESTNET else 'Mainnet'}...{X}")
+    print(f"\n  {D}Kết nối {EXCHANGE_ID.upper()} {'Testnet' if IS_TESTNET else 'Mainnet'}...{X}")
     ex = create_exchange()
     ex.load_markets()
     print(f"  {G}✓ {len(ex.markets):,} cặp{X}")
 
-    # ── Chọn pair ──
+    # ── Chọn pair (ưu tiên DEFAULT_PAIR trong .env/env vars) ──
     while True:
         try:
-            raw = input(f"\n  {B}▶ Nhập cặp giao dịch: {X}").strip()
-            if not raw: continue
+            if DEFAULT_PAIR:
+                raw = DEFAULT_PAIR
+                print(f"\n  {B}▶ DEFAULT_PAIR: {X}{C}{raw}{X}")
+            else:
+                raw = input(f"\n  {B}▶ Nhập cặp giao dịch: {X}").strip()
+                if not raw:
+                    continue
+
             symbol = normalize_symbol(raw, ex)
             setup_pair(symbol)
 
             if SPREAD_PCT is None:
+                if DEFAULT_PAIR:
+                    print(f"  {R}✗ Chưa có SPREAD_{PAIR} trong .env cho DEFAULT_PAIR.{X}")
+                    return
                 custom = input(f"  {Y}Chưa có SPREAD cho {PAIR} trong .env. Nhập spread %: {X}").strip()
                 try:
                     SPREAD_MAP[PAIR] = float(custom)
                 except ValueError:
-                    print(f"  {R}Không hợp lệ.{X}"); continue
+                    print(f"  {R}Không hợp lệ.{X}")
+                    continue
                 setup_pair(symbol)
 
             print(f"  {G}✓ {SYMBOL}  |  Spread: {SPREAD_PCT}%  |  Fee: {FEE_PCT}%/side{X}")
             break
         except ValueError as e:
             print(f"  {R}{e}{X}")
+            if DEFAULT_PAIR:
+                return
 
     min_spread = FEE_PCT * 2
     if SPREAD_PCT <= min_spread:
         print(f"  {Y}⚠ Spread {SPREAD_PCT}% ≤ phí 2 chiều {min_spread}% → có thể lỗ!{X}")
 
     min_amt, min_cost = limits(ex)
-    bid, ask = fetch_ba(ex)
+    try:
+        bid, ask = fetch_ba(ex)
+    except Exception as e:
+        log(f"Lỗi fetch BID/ASK ban đầu ({EXCHANGE_ID.upper()}): {e}", R)
+        return
     q = bal(ex, QUOTE)
     b = bal(ex, BASE)
 
@@ -453,7 +533,8 @@ def main():
     cycle = 0
 
     net_tag = "TESTNET" if IS_TESTNET else "MAINNET"
-    print(f"\n  {BG_G}{W}{B} BOT OTO {PAIR} — {net_tag} {X}  {D}CSV: {tlog.fn}  |  Ctrl+C dừng{X}\n")
+    mode_tag = "OTO" if EXCHANGE_ID == "binance" else "LIMIT(BUY->SELL)"
+    print(f"\n  {BG_G}{W}{B} BOT {mode_tag} {PAIR} — {EXCHANGE_ID.upper()} {net_tag} {X}  {D}CSV: OFF  |  Ctrl+C dừng{X}\n")
 
     try:
         while True:
@@ -532,6 +613,308 @@ def main():
                 time.sleep(3); cycle -= 1; continue
 
             # ══════════════════════════════════════════════
+            #  BINANCE: dùng OTO (nếu có). MEXC: fallback "limit buy + timeout cancel + limit sell"
+            # ══════════════════════════════════════════════
+            if EXCHANGE_ID != "binance":
+                buy_filled_at = None
+                buy_fp = 0.0
+                buy_fa = 0.0
+                buy_cost = 0.0
+
+                trade = {"cycle": cycle, "time": ts_short, "buy_price": buy_price,
+                          "sell_price": None, "amount": buy_qty, "pnl": 0,
+                          "dur": None, "status": f"{EXCHANGE_ID.upper()}: MUA chờ..."}
+                history.append(trade)
+
+                display(cycle, bid, ask,
+                        f"[#{cycle}] MUA {buy_qty} @ {fmt(buy_price)} → (timeout {BUY_TIMEOUT}s) BÁN @ {fmt(sell_price)}",
+                        summary, history, q, b, rl=rate_used(ex))
+
+                try:
+                    bo = ex.create_limit_buy_order(SYMBOL, buy_qty, buy_price)
+                    buy_oid = bo["id"]
+                    inv_bal()
+                except Exception as e:
+                    log(f"[{EXCHANGE_ID.upper()}] Lỗi đặt BUY: {e}", R)
+                    time.sleep(COOLDOWN)
+                    cycle -= 1
+                    continue
+
+                buy_result, buy_status = wait_buy(ex, buy_oid, BUY_TIMEOUT)
+
+                if buy_status != "filled":
+                    # Timeout (có thể partial) → cancel và check filled
+                    cancel_safe(ex, buy_oid)
+                    time.sleep(0.3)
+                    try:
+                        can = ex.fetch_order(buy_oid, SYMBOL)
+                        pf = float(can.get("filled", 0) or 0)
+                        if pf <= 0:
+                            pf = 0.0
+                    except Exception:
+                        pf = 0.0
+
+                    if pf > 0 and (not min_amt or pf >= min_amt):
+                        pa = float(can.get("average", 0) or can.get("price", 0) or buy_price)
+                        pc_val = float(can.get("cost", 0) or pa * pf)
+
+                        log(f"[{EXCHANGE_ID.upper()}] ⚡ Partial MUA: {pf}/{buy_qty} @ {fmt(pa)}", Y)
+
+                        # Bán thủ công phần partial
+                        inv_bal()
+                        b_now = bal(ex, BASE)
+                        sell_amt_p = s_amt(ex, b_now) if b_now > 0 else s_amt(ex, pf * (1 - FEE_RATE))
+                        sp_manual = s_price(ex, pa * (1 + SPREAD_PCT / 100))
+
+                        trade["buy_price"] = pa
+                        trade["amount"] = pf
+                        trade["status"] = "→ BÁN partial"
+
+                        tlog.write({"cycle": cycle, "timestamp": ts_now, "side": "BUY",
+                                    "order_price": buy_price, "filled_price": pa,
+                                    "amount": buy_qty, "filled_amount": pf,
+                                    "cost": pc_val, "status": "partial", "order_id": buy_oid,
+                                    "pnl": 0, "duration_s": 0,
+                                    "fee_quote": round(pc_val * FEE_RATE, 2),
+                                    "note": f"{EXCHANGE_ID} partial buy {pf}/{buy_qty}"})
+
+                        buy_fp = pa
+                        buy_fa = pf
+                        buy_cost = pc_val
+                        buy_filled_at = time.time()
+
+                        try:
+                            so = ex.create_limit_sell_order(SYMBOL, sell_amt_p, sp_manual)
+                            inv_bal()
+                            sell_oid = so["id"]
+                        except Exception as e:
+                            log(f"[{EXCHANGE_ID.upper()}] Lỗi đặt SELL partial: {e}", R)
+                            trade["status"] = "LỖI"
+                            if sp_filled > 0:
+                                pause_after_trade()
+                            else:
+                                time.sleep(COOLDOWN)
+                            continue
+
+                        open_t = {"cycle": cycle, "buy_price": buy_fp,
+                                  "sell_target": sp_manual, "amount": sell_amt_p}
+                        last_bid, last_ask = bid, ask
+
+                        def sell_cb(elapsed):
+                            nonlocal last_bid, last_ask
+                            trade["status"] = f"→ BÁN ({int(elapsed)}s)"
+                            try:
+                                last_bid, last_ask = fetch_ba(ex)
+                            except Exception:
+                                pass
+                            display(cycle, last_bid, last_ask,
+                                    f"[#{cycle}] Chờ BÁN #{sell_oid} @ {fmt(sp_manual)}... ({int(elapsed)}s)",
+                                    summary, history, bal(ex, QUOTE), sell_amt_p, open_t, rate_used(ex))
+
+                        display(cycle, bid, ask,
+                                f"[#{cycle}] ✓ MUA partial {buy_fa} @ {fmt(buy_fp)} → chờ BÁN @ {fmt(sp_manual)}",
+                                summary, history, bal(ex, QUOTE), sell_amt_p, open_t, rate_used(ex))
+
+                        sell_result = wait_sell(ex, sell_oid, sell_cb)
+                        # Xử lý sell
+                        if sell_result.get("status") == "canceled":
+                            sp_filled = float(sell_result.get("filled", 0) or 0)
+                            sp_cost = float(sell_result.get("cost", 0) or 0)
+                            dur = round(time.time() - buy_filled_at, 1) if buy_filled_at else 0
+
+                            if sp_filled > 0:
+                                ppnl = net_pnl(sp_cost, buy_cost)
+                                fees = est_fees(sp_cost, buy_cost)
+                                trade["sell_price"] = float(sell_result.get("average", 0) or sp_manual)
+                                trade["pnl"] = ppnl
+                                trade["dur"] = dur
+                                trade["status"] = "⚡partial"
+                                summary["total"] += 1
+                                summary["total_pnl"] += ppnl
+                                summary["total_fees"] += fees
+
+                                tlog.write({"cycle": cycle, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                            "side": "SELL", "order_price": sp_manual,
+                                            "filled_price": trade["sell_price"], "amount": sell_amt_p,
+                                            "filled_amount": sp_filled, "cost": sp_cost,
+                                            "status": "partial", "order_id": sell_oid,
+                                            "pnl": round(ppnl, 2), "duration_s": dur,
+                                            "fee_quote": round(fees, 2), "note": f"{EXCHANGE_ID} partial sell"})
+                            else:
+                                trade["status"] = "HỦY"
+                            time.sleep(COOLDOWN)
+                            continue
+
+                        sf_price = float(sell_result.get("average", 0) or sell_result.get("price", 0) or sp_manual)
+                        sf_amt = float(sell_result.get("filled", 0) or sell_amt_p)
+                        sf_cost = float(sell_result.get("cost", 0) or sf_price * sf_amt)
+                        dur = round(time.time() - buy_filled_at, 1) if buy_filled_at else 0
+
+                        pnl = net_pnl(sf_cost, buy_cost)
+                        fees = est_fees(sf_cost, buy_cost)
+                        pc_c = G if pnl >= 0 else R
+                        log(f"[{EXCHANGE_ID.upper()}] ✓ BÁN partial @ {fmt(sf_price)} → PnL ròng: {pc_c}{B}{fmt(pnl)} {QUOTE}{X} (phí ~{fmt(fees)}) ⏱ {dur}s", G)
+
+                        tlog.write({"cycle": cycle, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    "side": "SELL", "order_price": sp_manual,
+                                    "filled_price": sf_price, "amount": sell_amt_p,
+                                    "filled_amount": sf_amt, "cost": sf_cost,
+                                    "status": "filled", "order_id": sell_oid,
+                                    "pnl": round(pnl, 2), "duration_s": dur,
+                                    "fee_quote": round(fees, 2), "note": f"{EXCHANGE_ID} spread"})
+
+                        trade["sell_price"] = sf_price
+                        trade["pnl"] = pnl
+                        trade["dur"] = dur
+                        trade["status"] = "✓" if pnl >= 0 else "✗"
+                        summary["total"] += 1
+                        summary["total_pnl"] += pnl
+                        summary["total_fees"] += fees
+                        if pnl > 0: summary["wins"] += 1
+                        elif pnl < 0: summary["losses"] += 1
+
+                        inv_bal()
+                        try:
+                            nb, na = fetch_ba(ex)
+                        except Exception:
+                            nb, na = bid, ask
+                        q = bal(ex, QUOTE); b = bal(ex, BASE)
+                        display(cycle, nb, na,
+                                f"Cycle #{cycle} xong. PnL: {fmt(pnl)} {QUOTE}. Số dư: {fmt(q)} {QUOTE}",
+                                summary, history, q, b, rl=rate_used(ex))
+                        pause_after_trade()
+                        continue
+
+                    # Không có partial → retry
+                    summary["retries"] += 1
+                    trade["status"] = "✗ hủy"
+                    log(f"[{EXCHANGE_ID.upper()}] ✗ Không khớp {BUY_TIMEOUT}s → hủy → quét lại", Y)
+                    if sp_filled > 0:
+                        pause_after_trade()
+                    else:
+                        time.sleep(COOLDOWN)
+                    continue
+
+                # BUY full
+                buy_fp = float(buy_result.get("average", 0) or buy_result.get("price", 0) or buy_price)
+                buy_fa = float(buy_result.get("filled", 0) or buy_qty)
+                buy_cost = float(buy_result.get("cost", 0) or buy_fp * buy_fa)
+                buy_filled_at = time.time()
+
+                log(f"[{EXCHANGE_ID.upper()}] ✓ MUA khớp: {buy_fa} @ {fmt(buy_fp)}", G)
+
+                tlog.write({"cycle": cycle, "timestamp": ts_now, "side": "BUY",
+                            "order_price": buy_price, "filled_price": buy_fp,
+                            "amount": buy_qty, "filled_amount": buy_fa,
+                            "cost": buy_cost, "status": "filled", "order_id": buy_oid,
+                            "pnl": 0, "duration_s": 0,
+                            "fee_quote": round(buy_cost * FEE_RATE, 2),
+                            "note": f"{EXCHANGE_ID} buy, sell @ {fmt(sell_price)}"})
+
+                trade["buy_price"] = buy_fp
+                trade["status"] = "→ BÁN"
+
+                # Place SELL
+                try:
+                    so = ex.create_limit_sell_order(SYMBOL, sell_qty, sell_price)
+                    inv_bal()
+                    sell_oid = so["id"]
+                except Exception as e:
+                    log(f"[{EXCHANGE_ID.upper()}] Lỗi đặt SELL: {e}", R)
+                    summary["retries"] += 1
+                    time.sleep(COOLDOWN)
+                    continue
+
+                open_t = {"cycle": cycle, "buy_price": buy_fp,
+                          "sell_target": sell_price, "amount": sell_qty}
+                last_bid, last_ask = bid, ask
+
+                def sell_cb(elapsed):
+                    nonlocal last_bid, last_ask
+                    trade["status"] = f"→ BÁN ({int(elapsed)}s)"
+                    try:
+                        last_bid, last_ask = fetch_ba(ex)
+                    except Exception:
+                        pass
+                    display(cycle, last_bid, last_ask,
+                            f"[#{cycle}] Chờ BÁN #{sell_oid} @ {fmt(sell_price)}... ({int(elapsed)}s)",
+                            summary, history, bal(ex, QUOTE), sell_qty, open_t, rate_used(ex))
+
+                display(cycle, bid, ask,
+                        f"[#{cycle}] ✓ MUA {buy_fa} @ {fmt(buy_fp)} → chờ BÁN @ {fmt(sell_price)}",
+                        summary, history, bal(ex, QUOTE), sell_qty, open_t, rate_used(ex))
+
+                sell_result = wait_sell(ex, sell_oid, sell_cb)
+
+                if sell_result.get("status") == "canceled":
+                    sp_filled = float(sell_result.get("filled", 0) or 0)
+                    sp_cost = float(sell_result.get("cost", 0) or 0)
+                    dur = round(time.time() - buy_filled_at, 1) if buy_filled_at else 0
+
+                    if sp_filled > 0:
+                        ppnl = net_pnl(sp_cost, buy_cost)
+                        fees = est_fees(sp_cost, buy_cost)
+                        trade["sell_price"] = float(sell_result.get("average", 0) or sell_price)
+                        trade["pnl"] = ppnl
+                        trade["dur"] = dur
+                        trade["status"] = "⚡partial"
+                        summary["total"] += 1
+                        summary["total_pnl"] += ppnl
+                        summary["total_fees"] += fees
+
+                        tlog.write({"cycle": cycle, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    "side": "SELL", "order_price": sell_price,
+                                    "filled_price": trade["sell_price"], "amount": sell_qty,
+                                    "filled_amount": sp_filled, "cost": sp_cost,
+                                    "status": "partial", "order_id": sell_oid,
+                                    "pnl": round(ppnl, 2), "duration_s": dur,
+                                    "fee_quote": round(fees, 2), "note": f"{EXCHANGE_ID} partial sell"})
+                    else:
+                        trade["status"] = "HỦY"
+                    time.sleep(COOLDOWN)
+                    continue
+
+                sf_price = float(sell_result.get("average", 0) or sell_result.get("price", 0) or sell_price)
+                sf_amt = float(sell_result.get("filled", 0) or sell_qty)
+                sf_cost = float(sell_result.get("cost", 0) or sf_price * sf_amt)
+                dur = round(time.time() - buy_filled_at, 1) if buy_filled_at else 0
+
+                pnl = net_pnl(sf_cost, buy_cost)
+                fees = est_fees(sf_cost, buy_cost)
+                pc_c = G if pnl >= 0 else R
+                log(f"[{EXCHANGE_ID.upper()}] ✓ BÁN @ {fmt(sf_price)} → PnL ròng: {pc_c}{B}{fmt(pnl)} {QUOTE}{X} (phí ~{fmt(fees)}) ⏱ {dur}s", G)
+
+                tlog.write({"cycle": cycle, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "side": "SELL", "order_price": sell_price,
+                            "filled_price": sf_price, "amount": sell_qty,
+                            "filled_amount": sf_amt, "cost": sf_cost,
+                            "status": "filled", "order_id": sell_oid,
+                            "pnl": round(pnl, 2), "duration_s": dur,
+                            "fee_quote": round(fees, 2), "note": f"{EXCHANGE_ID} spread"})
+
+                trade["sell_price"] = sf_price
+                trade["pnl"] = pnl
+                trade["dur"] = dur
+                trade["status"] = "✓" if pnl >= 0 else "✗"
+                summary["total"] += 1
+                summary["total_pnl"] += pnl
+                summary["total_fees"] += fees
+                if pnl > 0: summary["wins"] += 1
+                elif pnl < 0: summary["losses"] += 1
+
+                inv_bal()
+                q = bal(ex, QUOTE); b = bal(ex, BASE)
+                try:
+                    nb, na = fetch_ba(ex)
+                except Exception:
+                    nb, na = bid, ask
+                display(cycle, nb, na,
+                        f"Cycle #{cycle} xong. PnL: {fmt(pnl)} {QUOTE}. Số dư: {fmt(q)} {QUOTE}",
+                        summary, history, q, b, rl=rate_used(ex))
+
+                pause_after_trade()
+                continue
+
             #  OTO: 1 lệnh = BUY LIMIT + auto SELL LIMIT
             # ══════════════════════════════════════════════
             display(cycle, bid, ask,
@@ -681,7 +1064,11 @@ def main():
                                 "fee_quote": round(fees, 2), "note": "partial sell"})
                 else:
                     trade["status"] = "HỦY"
-                time.sleep(COOLDOWN); continue
+                if sp_filled > 0:
+                    pause_after_trade()
+                else:
+                    time.sleep(COOLDOWN)
+                continue
 
             # ── Bán khớp! ──
             sf_price = float(sell_result.get("average", 0) or sell_result.get("price", 0) or sell_price)
@@ -722,7 +1109,7 @@ def main():
                     f"Cycle #{cycle} xong. PnL: {fmt(pnl)} {QUOTE}. Số dư: {fmt(q)} {QUOTE}",
                     summary, history, q, b, rl=rate_used(ex))
 
-            time.sleep(COOLDOWN)
+            pause_after_trade()
 
     except KeyboardInterrupt:
         pass
@@ -757,12 +1144,7 @@ def main():
                 print(f"  {hpc}{h['cycle']:>4}  {h['time']:<10} {fmt(h['buy_price']):>16} "
                       f"{sp:>16} {h['amount']:>12} {pp:>14} {ds:>8}{X}")
 
-        if tlog.n > 0:
-            print(f"\n  {G}{B}✓ {tlog.n} dòng → {tlog.fn}{X}")
-        else:
-            print(f"\n  {Y}Không có giao dịch.{X}")
-            try: os.remove(tlog.fn)
-            except OSError: pass
+        print(f"\n  {D}CSV export: OFF{X}")
         print()
 
 
