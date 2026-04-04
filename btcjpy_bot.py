@@ -716,10 +716,7 @@ def main():
                         except Exception as e:
                             log(f"[{EXCHANGE_ID.upper()}] Lỗi đặt SELL partial: {e}", R)
                             trade["status"] = "LỖI"
-                            if sp_filled > 0:
-                                pause_after_trade()
-                            else:
-                                time.sleep(COOLDOWN)
+                            time.sleep(COOLDOWN)
                             continue
 
                         open_t = {"cycle": cycle, "buy_price": buy_fp,
@@ -811,14 +808,11 @@ def main():
                         pause_after_trade()
                         continue
 
-                    # Không có partial → retry
+                    # Không có partial → retry (pf=0 hoặc dưới min_amt; không có biến sp_filled ở đây)
                     summary["retries"] += 1
                     trade["status"] = "✗ hủy"
                     log(f"[{EXCHANGE_ID.upper()}] ✗ Không khớp {BUY_TIMEOUT}s → hủy → quét lại", Y)
-                    if sp_filled > 0:
-                        pause_after_trade()
-                    else:
-                        time.sleep(COOLDOWN)
+                    time.sleep(COOLDOWN)
                     continue
 
                 # BUY full
