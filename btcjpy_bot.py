@@ -8,6 +8,9 @@ from dotenv import dotenv_values
 
 if os.name == "nt":
     os.system("chcp 65001 > nul")
+else:
+    # Railway/container thường không set TERM; tránh cảnh báo khi gọi `clear`
+    os.environ.setdefault("TERM", "dumb")
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 # ═══════════════════════════════════════════════════════════════
@@ -98,6 +101,9 @@ SPREAD_PCT = 0.0
 FEE_PCT = 0.0
 FEE_RATE = 0.0
 
+# Ước lượng tần suất request MEXC (client-side, rolling ~10s) — Spot doc: IP/UID limit theo nhóm endpoint
+_MEXC_REQ_TS = []
+
 # ═══════════════════════════════════════════════════════════════
 #  COLORS
 # ═══════════════════════════════════════════════════════════════
@@ -163,6 +169,7 @@ def fetch_ba(ex):
             ob = ex.fetch_order_book(SYMBOL, limit=5)
             if not ob.get("bids") or not ob.get("asks"):
                 raise ValueError("Order book trống")
+            _mexc_bump_request()
             return ob["bids"][0][0], ob["asks"][0][0]
         except (ccxt.RequestTimeout, ccxt.NetworkError) as e:
             last_err = e
@@ -194,6 +201,7 @@ def bal(ex, cur):
     now = time.time()
     if _bc["d"] is None or (now - _bc["t"]) > 1.0:
         _bc["d"] = ex.fetch_balance()
+        _mexc_bump_request()
         _bc["t"] = now
     return float(_bc["d"].get(cur, {}).get("free", 0) or 0)
 
@@ -202,15 +210,58 @@ def inv_bal():
     _bc["d"] = None; _bc["t"] = 0
 
 
-def rate_used(ex):
+def _mexc_bump_request():
+    if EXCHANGE_ID != "mexc":
+        return
+    now = time.time()
+    _MEXC_REQ_TS.append(now)
+    while _MEXC_REQ_TS and now - _MEXC_REQ_TS[0] > 10.0:
+        _MEXC_REQ_TS.pop(0)
+
+
+def _mexc_requests_last_10s():
+    if EXCHANGE_ID != "mexc":
+        return 0
+    now = time.time()
+    while _MEXC_REQ_TS and now - _MEXC_REQ_TS[0] > 10.0:
+        _MEXC_REQ_TS.pop(0)
+    return len(_MEXC_REQ_TS)
+
+
+def rate_status(ex):
+    """Chuỗi hiển thị rate/limit (Binance: weight 1m; MEXC Spot: header + đếm client + ghi chú doc)."""
     h = getattr(ex, "last_response_headers", None) or {}
-    u = (
-        h.get("x-mbx-used-weight-1m")
-        or h.get("X-MBX-USED-WEIGHT-1M")
-        or h.get("x-mexc-used-weight-1m")
-        or h.get("X-MEXC-USED-WEIGHT-1M")
-    )
-    return int(u) if u else None
+    hl = {str(k).lower(): str(v).strip() for k, v in h.items()}
+
+    if EXCHANGE_ID == "binance":
+        u = hl.get("x-mbx-used-weight-1m")
+        if u is None:
+            return ""
+        try:
+            n = int(u)
+        except ValueError:
+            return ""
+        pct = min(100.0, n / RATE_MAX * 100) if RATE_MAX else 0.0
+        rc = R if pct > 80 else (Y if pct > 50 else G)
+        return f"  |  Binance API: {rc}{n}/{RATE_MAX} ({pct:.0f}%){X}"
+
+    if EXCHANGE_ID == "mexc":
+        hdr = []
+        for k in sorted(hl):
+            if any(s in k for s in ("rate", "limit", "retry")):
+                hdr.append(f"{k}={hl[k]}")
+        n10 = _mexc_requests_last_10s()
+        lim_ms = int(getattr(ex, "rateLimit", 0) or 0)
+        parts = [
+            f"~{n10} req/10s (client)",
+            f"ccxt min {lim_ms}ms",
+            "Spot doc: IP 300/10s · UID 500/10s (theo nhóm endpoint)",
+        ]
+        if hdr:
+            parts.append("hdr: " + " · ".join(hdr[:5]))
+        return f"  |  {Y}MEXC {' · '.join(parts)}{X}"
+
+    return ""
 
 
 def limits(ex):
@@ -341,7 +392,11 @@ class TLog:
 
 def display(cycle, bid, ask, state, summary, history,
             q_bal=0, b_bal=0, open_trade=None, rl=None):
-    os.system("cls" if os.name == "nt" else "clear")
+    if os.name == "nt":
+        os.system("cls")
+    else:
+        # Không gọi `clear` (cần TERM hợp lệ trên một số container)
+        print("\033[2J\033[H", end="")
     w = 76
     now = datetime.now().strftime("%H:%M:%S")
     spread = ask - bid
@@ -356,11 +411,7 @@ def display(cycle, bid, ask, state, summary, history,
     total_all = realized + unrealized
 
     net_tag = "TESTNET" if IS_TESTNET else f"{BG_R}{W} MAINNET {X}"
-    rl_str = ""
-    if rl is not None:
-        pct = rl / RATE_MAX * 100
-        rc = R if pct > 80 else (Y if pct > 50 else G)
-        rl_str = f"  |  API: {rc}{rl}/{RATE_MAX} ({pct:.0f}%){X}"
+    rl_str = rl if isinstance(rl, str) else ""
 
     print()
     print(f"  {B}╔{'═'*w}╗{X}")
@@ -595,7 +646,7 @@ def main():
                 history.append(trade)
 
                 display(cycle, bid, ask, f"[#{cycle}] RECOVERY bán {sell_amt} {BASE} @ {fmt(buy_price)}",
-                        summary, history, q, b, rl=rate_used(ex))
+                        summary, history, q, b, rl=rate_status(ex))
                 try:
                     sell_order = ex.create_limit_sell_order(SYMBOL, sell_amt, buy_price)
                     inv_bal()
@@ -654,7 +705,7 @@ def main():
 
                 display(cycle, bid, ask,
                         f"[#{cycle}] MUA {buy_qty} @ {fmt(buy_price)} → (timeout {BUY_TIMEOUT}s) BÁN @ {fmt(sell_price)}",
-                        summary, history, q, b, rl=rate_used(ex))
+                        summary, history, q, b, rl=rate_status(ex))
 
                 try:
                     bo = ex.create_limit_buy_order(SYMBOL, buy_qty, buy_price)
@@ -732,11 +783,11 @@ def main():
                                 pass
                             display(cycle, last_bid, last_ask,
                                     f"[#{cycle}] Chờ BÁN #{sell_oid} @ {fmt(sp_manual)}... ({int(elapsed)}s)",
-                                    summary, history, bal(ex, QUOTE), sell_amt_p, open_t, rate_used(ex))
+                                    summary, history, bal(ex, QUOTE), sell_amt_p, open_t, rate_status(ex))
 
                         display(cycle, bid, ask,
                                 f"[#{cycle}] ✓ MUA partial {buy_fa} @ {fmt(buy_fp)} → chờ BÁN @ {fmt(sp_manual)}",
-                                summary, history, bal(ex, QUOTE), sell_amt_p, open_t, rate_used(ex))
+                                summary, history, bal(ex, QUOTE), sell_amt_p, open_t, rate_status(ex))
 
                         sell_result = wait_sell(ex, sell_oid, sell_cb)
                         # Xử lý sell
@@ -804,7 +855,7 @@ def main():
                         q = bal(ex, QUOTE); b = bal(ex, BASE)
                         display(cycle, nb, na,
                                 f"Cycle #{cycle} xong. PnL: {fmt(pnl)} {QUOTE}. Số dư: {fmt(q)} {QUOTE}",
-                                summary, history, q, b, rl=rate_used(ex))
+                                summary, history, q, b, rl=rate_status(ex))
                         pause_after_trade()
                         continue
 
@@ -858,11 +909,11 @@ def main():
                         pass
                     display(cycle, last_bid, last_ask,
                             f"[#{cycle}] Chờ BÁN #{sell_oid} @ {fmt(sell_price)}... ({int(elapsed)}s)",
-                            summary, history, bal(ex, QUOTE), sell_qty, open_t, rate_used(ex))
+                            summary, history, bal(ex, QUOTE), sell_qty, open_t, rate_status(ex))
 
                 display(cycle, bid, ask,
                         f"[#{cycle}] ✓ MUA {buy_fa} @ {fmt(buy_fp)} → chờ BÁN @ {fmt(sell_price)}",
-                        summary, history, bal(ex, QUOTE), sell_qty, open_t, rate_used(ex))
+                        summary, history, bal(ex, QUOTE), sell_qty, open_t, rate_status(ex))
 
                 sell_result = wait_sell(ex, sell_oid, sell_cb)
 
@@ -930,7 +981,7 @@ def main():
                     nb, na = bid, ask
                 display(cycle, nb, na,
                         f"Cycle #{cycle} xong. PnL: {fmt(pnl)} {QUOTE}. Số dư: {fmt(q)} {QUOTE}",
-                        summary, history, q, b, rl=rate_used(ex))
+                        summary, history, q, b, rl=rate_status(ex))
 
                 pause_after_trade()
                 continue
@@ -939,7 +990,7 @@ def main():
             # ══════════════════════════════════════════════
             display(cycle, bid, ask,
                     f"[#{cycle}] OTO: MUA {buy_qty} @ {fmt(buy_price)} → BÁN @ {fmt(sell_price)}",
-                    summary, history, q, b, rl=rate_used(ex))
+                    summary, history, q, b, rl=rate_status(ex))
 
             try:
                 log(f"[OTO] BUY {buy_qty} @ {fmt(buy_price)} + SELL {sell_qty} @ {fmt(sell_price)}", C)
@@ -974,7 +1025,7 @@ def main():
             else:
                 display(cycle, bid, ask,
                         f"[#{cycle}] Chờ MUA #{buy_oid} @ {fmt(buy_price)}...",
-                        summary, history, q, b, rl=rate_used(ex))
+                        summary, history, q, b, rl=rate_status(ex))
 
                 buy_result, buy_status = wait_buy(ex, buy_oid, BUY_TIMEOUT)
 
@@ -1056,11 +1107,11 @@ def main():
                 except Exception: pass
                 display(cycle, last_bid, last_ask,
                         f"[#{cycle}] Chờ BÁN #{sell_oid} @ {fmt(sell_price)}... ({int(elapsed)}s)",
-                        summary, history, bal(ex, QUOTE), sell_qty, open_t, rate_used(ex))
+                        summary, history, bal(ex, QUOTE), sell_qty, open_t, rate_status(ex))
 
             display(cycle, bid, ask,
                     f"[#{cycle}] ✓ MUA {buy_fa} @ {fmt(buy_fp)} → chờ BÁN @ {fmt(sell_price)}",
-                    summary, history, bal(ex, QUOTE), sell_qty, open_t, rate_used(ex))
+                    summary, history, bal(ex, QUOTE), sell_qty, open_t, rate_status(ex))
 
             sell_result = wait_sell(ex, sell_oid, sell_cb)
 
@@ -1127,7 +1178,7 @@ def main():
             except Exception: pass
             display(cycle, bid, ask,
                     f"Cycle #{cycle} xong. PnL: {fmt(pnl)} {QUOTE}. Số dư: {fmt(q)} {QUOTE}",
-                    summary, history, q, b, rl=rate_used(ex))
+                    summary, history, q, b, rl=rate_status(ex))
 
             pause_after_trade()
 
