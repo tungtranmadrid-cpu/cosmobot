@@ -72,6 +72,22 @@ for key, val in ENV_MAP.items():
     if key.startswith("FEE_") and key != "FEE_DEFAULT":
         try: FEE_MAP[key[4:].upper()] = float(val)
         except ValueError: pass
+# Railway: SPREAD_* / FEE_* chỉ có trong biến môi trường (không có file .env) — merge và ghi đè
+for key, val in os.environ.items():
+    k = str(key).strip()
+    if not k:
+        continue
+    v = str(val).strip() if val is not None else ""
+    if k.startswith("SPREAD_"):
+        try:
+            SPREAD_MAP[k[7:].upper()] = float(v)
+        except ValueError:
+            pass
+    elif k.startswith("FEE_") and k != "FEE_DEFAULT":
+        try:
+            FEE_MAP[k[4:].upper()] = float(v)
+        except ValueError:
+            pass
 FEE_DEFAULT = float(_cfg("FEE_DEFAULT", "0.1"))
 
 SYMBOL = ""
