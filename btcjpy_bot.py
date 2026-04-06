@@ -304,18 +304,30 @@ def est_fees(sell_cost, buy_cost):
 #  OTO ORDER — 1 API call = BUY LIMIT + auto SELL LIMIT
 # ═══════════════════════════════════════════════════════════════
 
+def _binance_oto_plain_str(n):
+    """
+    Binance OTO yêu cầu workingPrice/pendingPrice dạng thuần số thập phân
+    (regex [0-9]+(\\.[0-9]+)?). str(float) có thể ra '1.5e-05' → lỗi -1100.
+    """
+    x = float(n)
+    s = f"{x:.20f}".rstrip("0").rstrip(".")
+    if s in ("", "-0"):
+        s = "0"
+    return s
+
+
 def place_oto(ex, buy_price, buy_qty, sell_price, sell_qty):
     params = {
         "symbol": PAIR,
         "workingType": "LIMIT",
         "workingSide": "BUY",
-        "workingPrice": str(buy_price),
-        "workingQuantity": str(buy_qty),
+        "workingPrice": _binance_oto_plain_str(buy_price),
+        "workingQuantity": _binance_oto_plain_str(buy_qty),
         "workingTimeInForce": "GTC",
         "pendingType": "LIMIT",
         "pendingSide": "SELL",
-        "pendingPrice": str(sell_price),
-        "pendingQuantity": str(sell_qty),
+        "pendingPrice": _binance_oto_plain_str(sell_price),
+        "pendingQuantity": _binance_oto_plain_str(sell_qty),
         "pendingTimeInForce": "GTC",
         "newOrderRespType": "FULL",
     }
