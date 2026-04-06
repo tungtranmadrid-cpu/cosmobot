@@ -63,6 +63,8 @@ else:
 BUY_TIMEOUT = float(_cfg("BUY_RETRY_TIMEOUT", "5"))
 # Nghỉ sau khi một vòng BUY->SELL đã chốt xong
 POST_TRADE_PAUSE = float(_cfg("POST_TRADE_PAUSE", "30"))
+# SELL của nhánh Binance OTO: chờ tối đa N giây rồi reprice theo ASK thấp nhất
+OTO_SELL_TIMEOUT = float(_cfg("OTO_SELL_TIMEOUT", "5"))
 POLL_INTERVAL = 0.5
 COOLDOWN = 0.3
 
@@ -103,6 +105,7 @@ FEE_RATE = 0.0
 
 # Ước lượng tần suất request MEXC (client-side, rolling ~10s) — Spot doc: IP/UID limit theo nhóm endpoint
 _MEXC_REQ_TS = []
+_MEXC_SELL_REPRICE_COUNT = 0
 
 # ═══════════════════════════════════════════════════════════════
 #  COLORS
@@ -290,6 +293,75 @@ def pause_after_trade():
     if POST_TRADE_PAUSE > 0:
         log(f"Nghỉ {POST_TRADE_PAUSE:.0f}s sau chu kỳ vừa chốt...", Y)
         time.sleep(POST_TRADE_PAUSE)
+
+
+def handle_mexc_open_sell(ex, summary):
+    """
+    Nếu MEXC còn lệnh SELL đang mở, bot sẽ ưu tiên theo dõi/reprice để thoát hàng,
+    không đi vào nhánh "số dư quá thấp -> dừng".
+    Trả về True nếu đã xử lý và nên skip phần còn lại của vòng lặp hiện tại.
+    """
+    global _MEXC_SELL_REPRICE_COUNT
+    if EXCHANGE_ID != "mexc":
+        return False
+    try:
+        opens = ex.fetch_open_orders(SYMBOL, limit=20)
+    except Exception:
+        return False
+
+    sells = []
+    for o in opens or []:
+        side = str(o.get("side", "")).lower()
+        status = str(o.get("status", "")).lower()
+        if side == "sell" and status in ("open", "new", "partially_filled"):
+            sells.append(o)
+
+    if not sells:
+        return False
+
+    sells.sort(key=lambda x: x.get("timestamp") or 0)
+    o = sells[0]
+    oid = o.get("id")
+    price = float(o.get("price", 0) or 0)
+    amount = float(o.get("amount", 0) or 0)
+    filled = float(o.get("filled", 0) or 0)
+    rem = max(0.0, amount - filled)
+    ts = o.get("timestamp")
+    elapsed = ((time.time() * 1000 - ts) / 1000) if ts else None
+
+    if rem <= 0:
+        return True
+
+    if elapsed is not None and elapsed < OTO_SELL_TIMEOUT:
+        log(f"[MEXC] Đang chờ SELL #{oid} còn {fmt(rem)} @ {fmt(price)} ({elapsed:.1f}s)", D)
+        time.sleep(COOLDOWN)
+        return True
+
+    cancel_safe(ex, oid)
+    time.sleep(0.2)
+    try:
+        _, ask_now = fetch_ba(ex)
+        ask_reprice = s_price(ex, ask_now)
+    except Exception:
+        ask_reprice = price if price > 0 else 0
+
+    rem = s_amt(ex, rem)
+    if rem <= 0:
+        time.sleep(COOLDOWN)
+        return True
+
+    try:
+        so = ex.create_limit_sell_order(SYMBOL, rem, ask_reprice)
+        inv_bal()
+        _MEXC_SELL_REPRICE_COUNT += 1
+        summary["retries"] += 1
+        log(f"[MEXC] SELL timeout {OTO_SELL_TIMEOUT}s → hủy #{oid}, đặt lại {rem} @ ASK {fmt(ask_reprice)} (#{so['id']})", Y)
+        if _MEXC_SELL_REPRICE_COUNT % 5 == 0:
+            log(f"[MEXC] Đã reprice SELL {_MEXC_SELL_REPRICE_COUNT} lần, tiếp tục cho đến khi bán xong.", Y)
+    except Exception as e:
+        log(f"[MEXC] Lỗi reprice SELL: {e}", R)
+    time.sleep(COOLDOWN)
+    return True
 
 
 def net_pnl(sell_cost, buy_cost):
@@ -641,6 +713,10 @@ def main():
                 log(f"Lỗi fetch: {e}", R)
                 time.sleep(COOLDOWN); cycle -= 1; continue
 
+            # MEXC: nếu còn SELL treo thì ưu tiên theo dõi/reprice tới khi thoát hàng xong
+            if handle_mexc_open_sell(ex, summary):
+                continue
+
             buy_price = s_price(ex, bid)
             sell_price = s_price(ex, buy_price * (1 + SPREAD_PCT / 100))
             use_q = q * USE_PCT
@@ -801,9 +877,47 @@ def main():
                                 f"[#{cycle}] ✓ MUA partial {buy_fa} @ {fmt(buy_fp)} → chờ BÁN @ {fmt(sp_manual)}",
                                 summary, history, bal(ex, QUOTE), sell_amt_p, open_t, rate_status(ex))
 
-                        sell_result = wait_sell(ex, sell_oid, sell_cb)
+                        sell_result, sell_status = wait_buy(ex, sell_oid, OTO_SELL_TIMEOUT)
+                        # SELL timeout -> hủy và đặt lại theo ASK thấp nhất, sau đó quay lại quét
+                        if sell_status == "timeout":
+                            cancel_safe(ex, sell_oid)
+                            time.sleep(0.2)
+                            try:
+                                sr_now = ex.fetch_order(sell_oid, SYMBOL)
+                            except Exception:
+                                sr_now = {}
+                            sf_partial = float(sr_now.get("filled", 0) or 0)
+                            rem = max(0.0, sell_amt_p - sf_partial)
+                            rem = s_amt(ex, rem) if rem > 0 else 0.0
+                            try:
+                                _, ask_now = fetch_ba(ex)
+                                ask_reprice = s_price(ex, ask_now)
+                            except Exception:
+                                ask_reprice = sp_manual
+
+                            if rem > 0 and (not min_amt or rem >= min_amt):
+                                try:
+                                    so_retry = ex.create_limit_sell_order(SYMBOL, rem, ask_reprice)
+                                    inv_bal()
+                                    summary["retries"] += 1
+                                    trade["status"] = "↻ reprice ASK"
+                                    log(
+                                        f"[{EXCHANGE_ID.upper()}] SELL timeout {OTO_SELL_TIMEOUT}s → hủy #{sell_oid}, "
+                                        f"đặt lại {rem} @ ASK {fmt(ask_reprice)} (#{so_retry['id']})",
+                                        Y,
+                                    )
+                                except Exception as e:
+                                    log(f"[{EXCHANGE_ID.upper()}] SELL timeout, lỗi đặt lại ASK: {e}", R)
+                            else:
+                                summary["retries"] += 1
+                                trade["status"] = "↻ reprice bỏ qua (rem quá nhỏ)"
+                                log(f"[{EXCHANGE_ID.upper()}] SELL timeout {OTO_SELL_TIMEOUT}s, lượng còn lại quá nhỏ ({fmt(rem)})", Y)
+
+                            time.sleep(COOLDOWN)
+                            continue
+
                         # Xử lý sell
-                        if sell_result.get("status") == "canceled":
+                        if sell_status == "cancelled" or sell_result.get("status") == "canceled":
                             sp_filled = float(sell_result.get("filled", 0) or 0)
                             sp_cost = float(sell_result.get("cost", 0) or 0)
                             dur = round(time.time() - buy_filled_at, 1) if buy_filled_at else 0
@@ -927,9 +1041,47 @@ def main():
                         f"[#{cycle}] ✓ MUA {buy_fa} @ {fmt(buy_fp)} → chờ BÁN @ {fmt(sell_price)}",
                         summary, history, bal(ex, QUOTE), sell_qty, open_t, rate_status(ex))
 
-                sell_result = wait_sell(ex, sell_oid, sell_cb)
+                sell_result, sell_status = wait_buy(ex, sell_oid, OTO_SELL_TIMEOUT)
 
-                if sell_result.get("status") == "canceled":
+                # SELL timeout -> hủy và đặt lại theo ASK thấp nhất, sau đó quay lại quét
+                if sell_status == "timeout":
+                    cancel_safe(ex, sell_oid)
+                    time.sleep(0.2)
+                    try:
+                        sr_now = ex.fetch_order(sell_oid, SYMBOL)
+                    except Exception:
+                        sr_now = {}
+                    sf_partial = float(sr_now.get("filled", 0) or 0)
+                    rem = max(0.0, sell_qty - sf_partial)
+                    rem = s_amt(ex, rem) if rem > 0 else 0.0
+                    try:
+                        _, ask_now = fetch_ba(ex)
+                        ask_reprice = s_price(ex, ask_now)
+                    except Exception:
+                        ask_reprice = sell_price
+
+                    if rem > 0 and (not min_amt or rem >= min_amt):
+                        try:
+                            so_retry = ex.create_limit_sell_order(SYMBOL, rem, ask_reprice)
+                            inv_bal()
+                            summary["retries"] += 1
+                            trade["status"] = "↻ reprice ASK"
+                            log(
+                                f"[{EXCHANGE_ID.upper()}] SELL timeout {OTO_SELL_TIMEOUT}s → hủy #{sell_oid}, "
+                                f"đặt lại {rem} @ ASK {fmt(ask_reprice)} (#{so_retry['id']})",
+                                Y,
+                            )
+                        except Exception as e:
+                            log(f"[{EXCHANGE_ID.upper()}] SELL timeout, lỗi đặt lại ASK: {e}", R)
+                    else:
+                        summary["retries"] += 1
+                        trade["status"] = "↻ reprice bỏ qua (rem quá nhỏ)"
+                        log(f"[{EXCHANGE_ID.upper()}] SELL timeout {OTO_SELL_TIMEOUT}s, lượng còn lại quá nhỏ ({fmt(rem)})", Y)
+
+                    time.sleep(COOLDOWN)
+                    continue
+
+                if sell_status == "cancelled" or sell_result.get("status") == "canceled":
                     sp_filled = float(sell_result.get("filled", 0) or 0)
                     sp_cost = float(sell_result.get("cost", 0) or 0)
                     dur = round(time.time() - buy_filled_at, 1) if buy_filled_at else 0
@@ -1125,9 +1277,49 @@ def main():
                     f"[#{cycle}] ✓ MUA {buy_fa} @ {fmt(buy_fp)} → chờ BÁN @ {fmt(sell_price)}",
                     summary, history, bal(ex, QUOTE), sell_qty, open_t, rate_status(ex))
 
-            sell_result = wait_sell(ex, sell_oid, sell_cb)
+            # Chỉ chờ SELL của OTO trong OTO_SELL_TIMEOUT giây.
+            # Quá thời gian: hủy SELL hiện tại, đặt lại ở ASK thấp nhất rồi quay lại chu kỳ quét.
+            sell_result, sell_status = wait_buy(ex, sell_oid, OTO_SELL_TIMEOUT)
+            if sell_status == "timeout":
+                cancel_safe(ex, sell_oid)
+                time.sleep(0.2)
+                try:
+                    sr_now = ex.fetch_order(sell_oid, SYMBOL)
+                except Exception:
+                    sr_now = {}
 
-            if sell_result.get("status") == "canceled":
+                sf_partial = float(sr_now.get("filled", 0) or 0)
+                rem = max(0.0, sell_qty - sf_partial)
+                rem = s_amt(ex, rem) if rem > 0 else 0.0
+
+                try:
+                    _, ask_now = fetch_ba(ex)
+                    ask_reprice = s_price(ex, ask_now)
+                except Exception:
+                    ask_reprice = sell_price
+
+                if rem > 0 and (not min_amt or rem >= min_amt):
+                    try:
+                        so_retry = ex.create_limit_sell_order(SYMBOL, rem, ask_reprice)
+                        inv_bal()
+                        summary["retries"] += 1
+                        trade["status"] = "↻ reprice ASK"
+                        log(
+                            f"[OTO] SELL timeout {OTO_SELL_TIMEOUT}s → hủy #{sell_oid}, "
+                            f"đặt lại {rem} @ ASK {fmt(ask_reprice)} (#{so_retry['id']})",
+                            Y,
+                        )
+                    except Exception as e:
+                        log(f"[OTO] SELL timeout, lỗi đặt lại ASK: {e}", R)
+                else:
+                    summary["retries"] += 1
+                    trade["status"] = "↻ reprice bỏ qua (rem quá nhỏ)"
+                    log(f"[OTO] SELL timeout {OTO_SELL_TIMEOUT}s, lượng còn lại quá nhỏ ({fmt(rem)})", Y)
+
+                time.sleep(COOLDOWN)
+                continue
+
+            if sell_status == "cancelled" or sell_result.get("status") == "canceled":
                 sp_filled = float(sell_result.get("filled", 0) or 0)
                 sp_cost = float(sell_result.get("cost", 0) or 0)
                 dur = round(time.time() - buy_filled_at, 1)
